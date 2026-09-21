@@ -22,6 +22,8 @@ from scrapy.squeues import (
     PickleFifoSQLiteQueue,
     PickleLifoDiskQueue,
     PickleLifoSQLiteQueue,
+    ResumableFifoDiskQueue,
+    ResumableLifoDiskQueue,
 )
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.test import get_crawler
@@ -196,6 +198,61 @@ class TestMarshalLifoSQLiteQueueRequest(TestRequestQueueBase):
             yield queue
         finally:
             queue.close()
+
+
+class TestResumableFifoDiskQueueRequest(TestRequestQueueBase):
+    is_fifo = True
+
+    @pytest.fixture
+    def q(self, crawler, tmp_path):
+        queue = build_from_crawler(
+            ResumableFifoDiskQueue, crawler, key=str(tmp_path / "resumable" / "fifo")
+        )
+        try:
+            yield queue
+        finally:
+            queue.close()
+
+
+class TestResumableLifoDiskQueueRequest(TestRequestQueueBase):
+    is_fifo = False
+
+    @pytest.fixture
+    def q(self, crawler, tmp_path):
+        queue = build_from_crawler(
+            ResumableLifoDiskQueue, crawler, key=str(tmp_path / "resumable" / "lifo")
+        )
+        try:
+            yield queue
+        finally:
+            queue.close()
+
+
+@pytest.mark.parametrize(
+    "queue_cls",
+    [
+        ResumableFifoDiskQueue,
+        ResumableLifoDiskQueue,
+    ],
+)
+def test_resumable_queue_survives_unclean_shutdown(
+    crawler: Crawler, tmp_path: Path, queue_cls: Any
+) -> None:
+    key = str(tmp_path / "queue")
+    queue = queue_cls.from_crawler(crawler=crawler, key=key)
+    queue.push(Request("https://example.com"))
+    # No close(), as if the process had been killed. The file is closed
+    # directly instead, since on Windows it cannot be replaced later while
+    # it is still open.
+    queue._file.close()
+    queue = queue_cls.from_crawler(crawler=crawler, key=key)
+    try:
+        assert len(queue) == 1
+        request = queue.pop()
+        assert request is not None
+        assert request.url == "https://example.com"
+    finally:
+        queue.close()
 
 
 @pytest.mark.parametrize(

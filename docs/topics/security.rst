@@ -338,3 +338,10 @@ request is written within its own transaction:
 
 * **Con:** scheduling requests becomes slower, which can be noticeable in
   crawls with a high request throughput.
+
+The ``Resumable`` queue types (``scrapy.squeues.ResumableFifoDiskQueue``
+and ``scrapy.squeues.ResumableLifoDiskQueue``, see
+:setting:`SCHEDULER_DISK_QUEUE`) offer the same guarantee without SQLite:
+they append every operation to a journal of checksummed records that is
+flushed to disk before the operation takes effect, and they skip corrupted
+or partially written records when recovering after an unclean shutdown.

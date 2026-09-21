@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from abc import abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -319,6 +320,7 @@ class Scheduler(BaseScheduler):
         self.logunser: bool = logunser
         self.stats: StatsCollector | None = stats
         self.crawler: Crawler | None = crawler
+        self._in_next_request: bool = False
         self._sdqclass: type[BaseQueue] | None = self._get_start_queue_cls(
             crawler, "DISK"
         )
@@ -359,6 +361,7 @@ class Scheduler(BaseScheduler):
             state = self.dqs.close()
             assert isinstance(self.dqdir, str)
             self._write_dqs_state(self.dqdir, state)
+            self._write_dqs_stats(self.dqdir)
         return self.df.close(reason)
 
     def enqueue_request(self, request: Request) -> bool:
@@ -393,17 +396,25 @@ class Scheduler(BaseScheduler):
         Increment the appropriate stats, such as: :stat:`scheduler/dequeued`,
         :stat:`scheduler/dequeued/disk`, :stat:`scheduler/dequeued/memory`.
         """
-        request: Request | None = self.mqs.pop()
-        assert self.stats is not None
-        if request is not None:
-            self.stats.inc_value("scheduler/dequeued/memory")
-        else:
-            request = self._dqpop()
+        if self._in_next_request:
+            # A reentrant call (e.g. from a reactor callback fired while a
+            # request is being dequeued) must not dequeue a second request.
+            return None
+        self._in_next_request = True
+        try:
+            request: Request | None = self.mqs.pop()
+            assert self.stats is not None
             if request is not None:
-                self.stats.inc_value("scheduler/dequeued/disk")
-        if request is not None:
-            self.stats.inc_value("scheduler/dequeued")
-        return request
+                self.stats.inc_value("scheduler/dequeued/memory")
+            else:
+                request = self._dqpop()
+                if request is not None:
+                    self.stats.inc_value("scheduler/dequeued/disk")
+            if request is not None:
+                self.stats.inc_value("scheduler/dequeued")
+            return request
+        finally:
+            self._in_next_request = False
 
     def __len__(self) -> int:
         """
@@ -490,9 +501,34 @@ class Scheduler(BaseScheduler):
         path = Path(dqdir, "active.json")
         if not path.exists():
             return ()
-        with path.open(encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with path.open(encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            logger.warning(
+                f"Ignoring unreadable scheduler state file {path}, "
+                f"starting with an empty queue state"
+            )
+            return ()
 
     def _write_dqs_state(self, dqdir: str, state: Any) -> None:
-        with Path(dqdir, "active.json").open("w", encoding="utf-8") as f:
-            json.dump(state, f)
+        self._atomic_write_json(Path(dqdir, "active.json"), state)
+
+    def _write_dqs_stats(self, dqdir: str) -> None:
+        assert self.stats is not None
+        stats = {
+            key: value
+            for key, value in self.stats.get_stats().items()
+            if key.startswith("scheduler/")
+        }
+        self._atomic_write_json(Path(dqdir, "scheduler.stats.json"), stats)
+
+    def _atomic_write_json(self, path: Path, data: Any) -> None:
+        """Write *data* as JSON into *path* atomically, so that a crash
+        cannot leave a partially written file behind."""
+        tmp_path = path.with_name(path.name + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_path.replace(path)

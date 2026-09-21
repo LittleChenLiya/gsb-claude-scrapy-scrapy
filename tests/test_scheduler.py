@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -28,10 +30,15 @@ if TYPE_CHECKING:
 
 
 class MockCrawler(Crawler):
-    def __init__(self, priority_queue_cls: str, jobdir: Path | None):
+    def __init__(
+        self,
+        priority_queue_cls: str,
+        jobdir: Path | None,
+        disk_queue_cls: str = "scrapy.squeues.PickleLifoDiskQueue",
+    ):
         settings = {
             "SCHEDULER_DEBUG": False,
-            "SCHEDULER_DISK_QUEUE": "scrapy.squeues.PickleLifoDiskQueue",
+            "SCHEDULER_DISK_QUEUE": disk_queue_cls,
             "SCHEDULER_MEMORY_QUEUE": "scrapy.squeues.LifoMemoryQueue",
             "SCHEDULER_PRIORITY_QUEUE": priority_queue_cls,
             "JOBDIR": str(jobdir) if jobdir is not None else None,
@@ -44,9 +51,11 @@ class MockCrawler(Crawler):
 
 @asynccontextmanager
 async def create_scheduler(
-    priority_queue_cls: str, jobdir: Path | None
+    priority_queue_cls: str,
+    jobdir: Path | None,
+    disk_queue_cls: str = "scrapy.squeues.PickleLifoDiskQueue",
 ) -> AsyncGenerator[Scheduler]:
-    mock_crawler = MockCrawler(priority_queue_cls, jobdir)
+    mock_crawler = MockCrawler(priority_queue_cls, jobdir, disk_queue_cls)
     scheduler = build_from_crawler(Scheduler, mock_crawler)
     spider = Spider.from_crawler(mock_crawler, name="spider")
     await ensure_awaitable(scheduler.open(spider))
@@ -72,6 +81,7 @@ _URLS = {"http://foo.com/a", "http://foo.com/b", "http://foo.com/c"}
 
 class TestSchedulerBase(ABC):
     reopen = False
+    disk_queue_cls = "scrapy.squeues.PickleLifoDiskQueue"
 
     @property
     @abstractmethod
@@ -85,7 +95,7 @@ class TestSchedulerBase(ABC):
     def create_scheduler(
         self, jobdir: Path | None
     ) -> AbstractAsyncContextManager[Scheduler]:
-        return create_scheduler(self.priority_queue_cls, jobdir)
+        return create_scheduler(self.priority_queue_cls, jobdir, self.disk_queue_cls)
 
     @asynccontextmanager
     async def create_scheduler_for_assertions(
@@ -165,6 +175,60 @@ class TestSchedulerInMemory(TestSchedulerInMemoryBase):
 
 class TestSchedulerOnDisk(TestSchedulerOnDiskBase):
     priority_queue_cls = "scrapy.pqueues.ScrapyPriorityQueue"
+
+
+class TestSchedulerOnDiskResumable(TestSchedulerOnDiskBase):
+    disk_queue_cls = "scrapy.squeues.ResumableLifoDiskQueue"
+    priority_queue_cls = "scrapy.pqueues.ScrapyPriorityQueue"
+
+
+class TestSchedulerRecovery:
+    priority_queue_cls = "scrapy.pqueues.ScrapyPriorityQueue"
+
+    @coroutine_test
+    async def test_corrupted_state_file_is_ignored(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        dqdir = tmp_path / "requests.queue"
+        dqdir.mkdir()
+        (dqdir / "active.json").write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="scrapy.core.scheduler"):
+            async with create_scheduler(self.priority_queue_cls, tmp_path) as scheduler:
+                assert not scheduler.has_pending_requests()
+        assert "Ignoring unreadable scheduler state file" in caplog.text
+
+    @coroutine_test
+    async def test_close_writes_stats_atomically(self, tmp_path: Path) -> None:
+        async with create_scheduler(self.priority_queue_cls, tmp_path) as scheduler:
+            scheduler.enqueue_request(Request("http://foo.com/a"))
+        dqdir = tmp_path / "requests.queue"
+        stats = json.loads((dqdir / "scheduler.stats.json").read_text(encoding="utf-8"))
+        assert stats["scheduler/enqueued"] == 1
+        assert all(key.startswith("scheduler/") for key in stats)
+        # No temporary files are left behind by the atomic writes.
+        assert not list(dqdir.glob("*.tmp"))
+
+
+class TestNextRequestReentrancy:
+    @coroutine_test
+    async def test_reentrant_next_request_returns_none(self) -> None:
+        async with create_scheduler(
+            "scrapy.pqueues.ScrapyPriorityQueue", None
+        ) as scheduler:
+            scheduler.enqueue_request(Request("http://foo.com/a"))
+            scheduler.enqueue_request(Request("http://foo.com/b"))
+            original_pop = scheduler.mqs.pop
+
+            def reentrant_pop() -> Request | None:
+                # A reactor callback fired while a request is being dequeued
+                # must not dequeue a second request.
+                assert scheduler.next_request() is None
+                return original_pop()
+
+            scheduler.mqs.pop = reentrant_pop  # type: ignore[method-assign]
+            assert scheduler.next_request() is not None
+            assert scheduler.next_request() is not None
+            assert scheduler.next_request() is None
 
 
 _URLS_WITH_SLOTS = [

@@ -2003,6 +2003,9 @@ Default: ``'scrapy.squeues.PickleLifoDiskQueue'``
 .. versionadded:: 2.19.0
    The ``SQLite`` queue types.
 
+.. versionadded:: VERSION
+   The ``Resumable`` queue types.
+
 Type of disk queue that will be used by the scheduler. Other available types
 are ``scrapy.squeues.PickleFifoDiskQueue``,
 ``scrapy.squeues.MarshalFifoDiskQueue``,
@@ -2015,6 +2018,14 @@ are ``scrapy.squeues.PickleFifoDiskQueue``,
 The ``SQLite`` types store requests in an SQLite database, which makes writes
 slower but keeps the queue usable after an unclean shutdown. See
 :ref:`security-job-state`.
+
+The ``Resumable`` types (``scrapy.squeues.ResumableFifoDiskQueue`` and
+``scrapy.squeues.ResumableLifoDiskQueue``) store requests in an append-only
+journal of checksummed records. Every confirmed operation is flushed to disk
+before it takes effect, so an unclean shutdown cannot lose requests, and
+corrupted or partially written records are skipped when the queue is
+recovered. This safety makes writes slower than with the other disk queue
+types. See :ref:`security-job-state`.
 
 
 .. setting:: SCHEDULER_MEMORY_QUEUE
