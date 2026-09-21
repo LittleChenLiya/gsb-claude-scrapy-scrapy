@@ -2016,6 +2016,17 @@ The ``SQLite`` types store requests in an SQLite database, which makes writes
 slower but keeps the queue usable after an unclean shutdown. See
 :ref:`security-job-state`.
 
+.. versionadded:: VERSION
+   The ``PickleResumableFifoDiskQueue`` and ``PickleResumableLifoDiskQueue``
+   queue types.
+
+The ``PickleResumable*`` types append requests to a journal file of
+CRC32-protected records, so an unclean shutdown or a partial write does not
+lose confirmed requests: when the job is resumed, corrupted or truncated
+records are skipped and the remaining requests are recovered in their
+original order. Queue statistics are saved atomically when the queue is
+closed.
+
 
 .. setting:: SCHEDULER_MEMORY_QUEUE
 

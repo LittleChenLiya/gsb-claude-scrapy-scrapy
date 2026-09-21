@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import threading
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -28,10 +30,15 @@ if TYPE_CHECKING:
 
 
 class MockCrawler(Crawler):
-    def __init__(self, priority_queue_cls: str, jobdir: Path | None):
+    def __init__(
+        self,
+        priority_queue_cls: str,
+        jobdir: Path | None,
+        disk_queue_cls: str = "scrapy.squeues.PickleLifoDiskQueue",
+    ):
         settings = {
             "SCHEDULER_DEBUG": False,
-            "SCHEDULER_DISK_QUEUE": "scrapy.squeues.PickleLifoDiskQueue",
+            "SCHEDULER_DISK_QUEUE": disk_queue_cls,
             "SCHEDULER_MEMORY_QUEUE": "scrapy.squeues.LifoMemoryQueue",
             "SCHEDULER_PRIORITY_QUEUE": priority_queue_cls,
             "JOBDIR": str(jobdir) if jobdir is not None else None,
@@ -44,9 +51,11 @@ class MockCrawler(Crawler):
 
 @asynccontextmanager
 async def create_scheduler(
-    priority_queue_cls: str, jobdir: Path | None
+    priority_queue_cls: str,
+    jobdir: Path | None,
+    disk_queue_cls: str = "scrapy.squeues.PickleLifoDiskQueue",
 ) -> AsyncGenerator[Scheduler]:
-    mock_crawler = MockCrawler(priority_queue_cls, jobdir)
+    mock_crawler = MockCrawler(priority_queue_cls, jobdir, disk_queue_cls)
     scheduler = build_from_crawler(Scheduler, mock_crawler)
     spider = Spider.from_crawler(mock_crawler, name="spider")
     await ensure_awaitable(scheduler.open(spider))
@@ -357,3 +366,126 @@ async def test_unserializable_requests(
     assert crawler.stats.get_value("scheduler/unserializable") == 2
     assert crawler.stats.get_value("scheduler/enqueued/memory") == 2
     assert caplog.text.count("Unable to serialize request") == 1
+
+
+_RESUMABLE_DISK_QUEUE = "scrapy.squeues.PickleResumableLifoDiskQueue"
+
+
+class TestSchedulerResumableDiskQueue:
+    @coroutine_test
+    async def test_resume_after_close(self, tmp_path: Path) -> None:
+        """Pending requests survive a clean close and are dequeued once."""
+        async with create_scheduler(
+            "scrapy.pqueues.ScrapyPriorityQueue", tmp_path, _RESUMABLE_DISK_QUEUE
+        ) as scheduler:
+            for url in _URLS:
+                scheduler.enqueue_request(Request(url))
+
+        urls = set()
+        async with create_scheduler(
+            "scrapy.pqueues.ScrapyPriorityQueue", tmp_path, _RESUMABLE_DISK_QUEUE
+        ) as scheduler:
+            assert len(scheduler) == len(_URLS)
+            while scheduler.has_pending_requests():
+                request = scheduler.next_request()
+                assert request is not None
+                urls.add(request.url)
+        assert urls == _URLS
+
+    @coroutine_test
+    async def test_resume_after_crash(self, tmp_path: Path) -> None:
+        """A crash without closing the queues does not lose pending requests."""
+        mock_crawler = MockCrawler(
+            "scrapy.pqueues.ScrapyPriorityQueue", tmp_path, _RESUMABLE_DISK_QUEUE
+        )
+        scheduler = build_from_crawler(Scheduler, mock_crawler)
+        spider = Spider.from_crawler(mock_crawler, name="spider")
+        await ensure_awaitable(scheduler.open(spider))
+        for url in _URLS:
+            scheduler.enqueue_request(Request(url))
+        # Simulate a crash: the OS closes the journal file handles, but the
+        # queues are never closed and their state is never compacted.
+        assert scheduler.dqs is not None
+        for queue in scheduler.dqs.queues.values():
+            queue._journal_file.close()  # type: ignore[attr-defined]
+        del scheduler
+        await mock_crawler.stop_async()
+        mock_crawler.engine.downloader.close()
+
+        urls = set()
+        async with create_scheduler(
+            "scrapy.pqueues.ScrapyPriorityQueue", tmp_path, _RESUMABLE_DISK_QUEUE
+        ) as scheduler:
+            while scheduler.has_pending_requests():
+                request = scheduler.next_request()
+                assert request is not None
+                urls.add(request.url)
+        assert urls == _URLS
+
+    @coroutine_test
+    async def test_stats_saved_atomically(self, tmp_path: Path) -> None:
+        async with create_scheduler(
+            "scrapy.pqueues.ScrapyPriorityQueue", tmp_path, _RESUMABLE_DISK_QUEUE
+        ) as scheduler:
+            for url in _URLS:
+                scheduler.enqueue_request(Request(url))
+            scheduler.next_request()
+
+        queue_dir = tmp_path / "requests.queue"
+        stats = json.loads((queue_dir / "scheduler-stats.json").read_text())
+        assert stats == {
+            "enqueued": len(_URLS),
+            "dequeued": 1,
+            "enqueued/disk": len(_URLS),
+            "dequeued/disk": 1,
+        }
+        assert not list(queue_dir.glob("*.tmp"))
+
+    @coroutine_test
+    async def test_corrupted_state_ignored(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        queue_dir = tmp_path / "requests.queue"
+        queue_dir.mkdir(parents=True)
+        (queue_dir / "active.json").write_text("not json", encoding="utf-8")
+        with caplog.at_level("WARNING"):
+            async with create_scheduler(
+                "scrapy.pqueues.ScrapyPriorityQueue", tmp_path, _RESUMABLE_DISK_QUEUE
+            ) as scheduler:
+                scheduler.enqueue_request(Request("https://example.com/a"))
+                request = scheduler.next_request()
+                assert request is not None
+                assert request.url == "https://example.com/a"
+        assert "Ignoring corrupted scheduler state file" in caplog.text
+
+
+class TestSchedulerConcurrency:
+    @coroutine_test
+    async def test_concurrent_next_request_no_duplicates(self) -> None:
+        """Concurrent reactor callbacks must not dequeue the same request twice."""
+        total = 1000
+        async with create_scheduler(
+            "scrapy.pqueues.ScrapyPriorityQueue", None
+        ) as scheduler:
+            for index in range(total):
+                scheduler.enqueue_request(Request(f"https://example.com/{index}"))
+
+            dequeued: list[str] = []
+            dequeued_lock = threading.Lock()
+
+            def worker() -> None:
+                while True:
+                    request = scheduler.next_request()
+                    if request is None:
+                        return
+                    with dequeued_lock:
+                        dequeued.append(request.url)
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        assert len(dequeued) == total
+        assert len(set(dequeued)) == total

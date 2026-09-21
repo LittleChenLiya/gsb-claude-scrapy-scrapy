@@ -106,6 +106,10 @@ stopping it cleanly. Forced, sudden or otherwise unclean shutdown can lead to
 data corruption in the job directory, which may prevent the spider from
 resuming correctly.
 
+Using a resumable disk queue (see :setting:`SCHEDULER_DISK_QUEUE`) reduces
+this risk: partially written or corrupted records are skipped when the job
+is resumed, and confirmed pending requests are recovered.
+
 Scrapy version changes
 ----------------------
 

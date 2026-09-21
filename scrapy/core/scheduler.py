@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
 from abc import abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -28,6 +30,15 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_json_dump(path: Path, data: Any) -> None:
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp_path.replace(path)
 
 
 class BaseSchedulerMeta(type):
@@ -237,7 +248,12 @@ class Scheduler(BaseScheduler):
         :setting:`SCHEDULER_PRIORITY_QUEUE`.
 
         The file is generated whenever the job stops (cleanly) and is loaded
-        when resuming the job.
+        when resuming the job. It is written atomically, and a corrupted
+        file is ignored (with a warning) when resuming the job.
+
+    -   Generates inside that directory a ``scheduler-stats.json`` file
+        with a JSON representation of the scheduler statistics, written
+        atomically whenever the job stops.
 
     -   Instantiates the configured :setting:`SCHEDULER_PRIORITY_QUEUE` with
         ``requests.queue/`` as persistence directory (*key*) and
@@ -319,6 +335,9 @@ class Scheduler(BaseScheduler):
         self.logunser: bool = logunser
         self.stats: StatsCollector | None = stats
         self.crawler: Crawler | None = crawler
+        # Serializes enqueue_request() and next_request() so that concurrent
+        # reactor callbacks cannot dequeue the same request twice.
+        self._lock: threading.Lock = threading.Lock()
         self._sdqclass: type[BaseQueue] | None = self._get_start_queue_cls(
             crawler, "DISK"
         )
@@ -359,6 +378,7 @@ class Scheduler(BaseScheduler):
             state = self.dqs.close()
             assert isinstance(self.dqdir, str)
             self._write_dqs_state(self.dqdir, state)
+            self._write_stats(self.dqdir)
         return self.df.close(reason)
 
     def enqueue_request(self, request: Request) -> bool:
@@ -374,14 +394,15 @@ class Scheduler(BaseScheduler):
         if not request.dont_filter and self.df.request_seen(request):
             self.df.log(request, self.spider)
             return False
-        dqok = self._dqpush(request)
-        assert self.stats is not None
-        if dqok:
-            self.stats.inc_value("scheduler/enqueued/disk")
-        else:
-            self._mqpush(request)
-            self.stats.inc_value("scheduler/enqueued/memory")
-        self.stats.inc_value("scheduler/enqueued")
+        with self._lock:
+            dqok = self._dqpush(request)
+            assert self.stats is not None
+            if dqok:
+                self.stats.inc_value("scheduler/enqueued/disk")
+            else:
+                self._mqpush(request)
+                self.stats.inc_value("scheduler/enqueued/memory")
+            self.stats.inc_value("scheduler/enqueued")
         return True
 
     def next_request(self) -> Request | None:
@@ -393,16 +414,17 @@ class Scheduler(BaseScheduler):
         Increment the appropriate stats, such as: :stat:`scheduler/dequeued`,
         :stat:`scheduler/dequeued/disk`, :stat:`scheduler/dequeued/memory`.
         """
-        request: Request | None = self.mqs.pop()
-        assert self.stats is not None
-        if request is not None:
-            self.stats.inc_value("scheduler/dequeued/memory")
-        else:
-            request = self._dqpop()
+        with self._lock:
+            request: Request | None = self.mqs.pop()
+            assert self.stats is not None
             if request is not None:
-                self.stats.inc_value("scheduler/dequeued/disk")
-        if request is not None:
-            self.stats.inc_value("scheduler/dequeued")
+                self.stats.inc_value("scheduler/dequeued/memory")
+            else:
+                request = self._dqpop()
+                if request is not None:
+                    self.stats.inc_value("scheduler/dequeued/disk")
+            if request is not None:
+                self.stats.inc_value("scheduler/dequeued")
         return request
 
     def __len__(self) -> int:
@@ -461,6 +483,8 @@ class Scheduler(BaseScheduler):
         assert self.dqdir
         assert self.pqclass
         state = self._read_dqs_state(self.dqdir)
+        if not isinstance(state, dict):
+            state = sorted(set(state) | self._disk_priorities(self.dqdir))
         q = build_from_crawler(
             self.pqclass,
             self.crawler,
@@ -490,9 +514,37 @@ class Scheduler(BaseScheduler):
         path = Path(dqdir, "active.json")
         if not path.exists():
             return ()
-        with path.open(encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with path.open(encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError) as e:
+            logger.warning(
+                f"Ignoring corrupted scheduler state file {path}: {e}",
+                extra={"spider": self.spider},
+            )
+            return ()
+
+    def _disk_priorities(self, dqdir: str) -> set[int]:
+        """Return the priorities with an existing queue directory, so that
+        pending requests are recovered even when the job crashed before
+        the state file could be written."""
+        priorities: set[int] = set()
+        for path in Path(dqdir).iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                priorities.add(int(path.name.removesuffix("s")))
+            except ValueError:
+                continue
+        return priorities
 
     def _write_dqs_state(self, dqdir: str, state: Any) -> None:
-        with Path(dqdir, "active.json").open("w", encoding="utf-8") as f:
-            json.dump(state, f)
+        _atomic_json_dump(Path(dqdir, "active.json"), state)
+
+    def _write_stats(self, dqdir: str) -> None:
+        assert self.stats is not None
+        stats = {
+            key: self.stats.get_value(f"scheduler/{key}", 0)
+            for key in ("enqueued", "dequeued", "enqueued/disk", "dequeued/disk")
+        }
+        _atomic_json_dump(Path(dqdir, "scheduler-stats.json"), stats)
