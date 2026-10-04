@@ -10,7 +10,9 @@ import pytest
 from scrapy.http import Request
 from scrapy.utils.python import to_bytes
 from scrapy.utils.request import (
+    HeadersMetaRequestFingerprinter,
     _fingerprint_cache,
+    _headers_meta_fingerprint_cache,
     fingerprint,
     request_httprepr,
     request_to_curl,
@@ -277,6 +279,255 @@ class TestRequestFingerprinter:
         assert crawler.request_fingerprinter.fingerprint(request) == fingerprint(
             request
         )
+
+
+class _TenantFingerprinter(HeadersMetaRequestFingerprinter):
+    include_headers = ("X-Tenant",)
+    include_meta = ("tenant",)
+
+
+class TestHeadersMetaRequestFingerprinter:
+    def test_tenant_meta_distinguishes(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/api", meta={"tenant": "a"})
+        r2 = Request("http://example.com/api", meta={"tenant": "b"})
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r2)
+
+    def test_tenant_header_distinguishes(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/api", headers={"X-Tenant": "a"})
+        r2 = Request("http://example.com/api", headers={"X-Tenant": "b"})
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r2)
+
+    def test_unlisted_meta_ignored(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request(
+            "http://example.com/api",
+            meta={"tenant": "a", "debug": "x"},
+        )
+        r2 = Request(
+            "http://example.com/api",
+            meta={"tenant": "a", "debug": "y"},
+        )
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_unlisted_headers_ignored(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/api", headers={"X-Debug": "x"})
+        r2 = Request("http://example.com/api", headers={"X-Debug": "y"})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_header_name_case_insensitive(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/api", headers={"X-Tenant": "a"})
+        r2 = Request("http://example.com/api", headers={"x-tenant": "a"})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_header_name_declaration_case_insensitive(self):
+        r = Request("http://example.com/api", headers={"X-Tenant": "a"})
+        upper = HeadersMetaRequestFingerprinter(include_headers=["X-TENANT"])
+        lower = HeadersMetaRequestFingerprinter(include_headers=["x-tenant"])
+        assert upper.fingerprint(r) == lower.fingerprint(r)
+
+    def test_multiple_header_value_order_matters(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request(
+            "http://example.com/api",
+            headers=[("X-Tenant", b"a"), ("X-Tenant", b"b")],
+        )
+        r2 = Request(
+            "http://example.com/api",
+            headers=[("X-Tenant", b"b"), ("X-Tenant", b"a")],
+        )
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r2)
+
+    def test_same_meta_same_fingerprint(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/api", meta={"tenant": "a"})
+        r2 = Request("http://example.com/api", meta={"tenant": "a"})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_url_canonicalized(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/query?a=1&b=2")
+        r2 = Request("http://example.com/query?b=2&a=1")
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_method_and_body(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com")
+        r2 = Request("http://example.com", method="POST")
+        r3 = Request("http://example.com", method="POST", body=b"body")
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r2)
+        assert fingerprinter.fingerprint(r2) != fingerprinter.fingerprint(r3)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            True,
+            False,
+            1,
+            1.5,
+            "a",
+            b"a",
+            [1, "a", None],
+            (1, "a"),
+            {"b": 2, "a": [1, 2]},
+        ],
+    )
+    def test_stable_meta_values(self, value: Any) -> None:
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/api", meta={"tenant": value})
+        r2 = Request("http://example.com/api", meta={"tenant": value})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_list_and_tuple_meta_equivalent(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/api", meta={"tenant": [1, 2]})
+        r2 = Request("http://example.com/api", meta={"tenant": (1, 2)})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_dict_meta_key_order_insensitive(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/api", meta={"tenant": {"a": 1, "b": 2}})
+        r2 = Request("http://example.com/api", meta={"tenant": {"b": 2, "a": 1}})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    @pytest.mark.parametrize("value", [object(), {"a", "b"}, frozenset("ab")])
+    def test_unsupported_meta_value_raises(self, value: Any) -> None:
+        fingerprinter = _TenantFingerprinter()
+        request = Request("http://example.com/api", meta={"tenant": value})
+        with pytest.raises(TypeError, match="Request meta key 'tenant'"):
+            fingerprinter.fingerprint(request)
+
+    def test_unsupported_nested_meta_value_raises(self):
+        fingerprinter = _TenantFingerprinter()
+        request = Request(
+            "http://example.com/api",
+            meta={"tenant": {"a": [1, object()]}},
+        )
+        with pytest.raises(TypeError, match=r"Request meta key \"tenant\['a'\]\[1\]\""):
+            fingerprinter.fingerprint(request)
+
+    def test_unsupported_meta_dict_key_raises(self):
+        fingerprinter = _TenantFingerprinter()
+        request = Request(
+            "http://example.com/api",
+            meta={"tenant": {1: "a"}},
+        )
+        with pytest.raises(TypeError, match="non-string dict key"):
+            fingerprinter.fingerprint(request)
+
+    def test_unsupported_value_repr_not_used(self):
+        class Weird:
+            def __repr__(self) -> str:
+                raise AssertionError("repr() must not be called")
+
+        fingerprinter = _TenantFingerprinter()
+        request = Request("http://example.com/api", meta={"tenant": Weird()})
+        # Raising AssertionError from __repr__ would surface instead of the
+        # TypeError if the value's representation were read.
+        with pytest.raises(TypeError, match="Request meta key 'tenant'"):
+            fingerprinter.fingerprint(request)
+
+    def test_request_not_mutated(self):
+        nested = {"ids": [1, 2]}
+        sentinel = object()
+        request = Request(
+            "http://example.com/api",
+            meta={"tenant": nested, "debug": sentinel},
+        )
+        fingerprinter = _TenantFingerprinter()
+        fingerprinter.fingerprint(request)
+        assert request.meta["tenant"] is nested
+        assert request.meta["tenant"]["ids"] == [1, 2]
+        assert request.meta["debug"] is sentinel
+        assert set(request.meta) >= {"tenant", "debug"}
+
+    def test_copy_gets_new_cache_entry(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com", meta={"tenant": "a"})
+        fp1 = fingerprinter.fingerprint(r1)
+        r2 = r1.replace(meta={"tenant": "b"})
+        fp2 = fingerprinter.fingerprint(r2)
+        assert fp1 != fp2
+        cache = _headers_meta_fingerprint_cache
+        assert r1 in cache
+        assert r2 in cache
+
+    def test_caching_uses_policy_version_in_key(self):
+        fingerprinter = _TenantFingerprinter()
+        request = Request("http://example.com", meta={"tenant": "a"})
+        fingerprinter.fingerprint(request)
+        cache_key = (
+            _TenantFingerprinter.VERSION,
+            fingerprinter._include_headers,
+            fingerprinter._include_meta,
+            False,
+            False,
+        )
+        assert cache_key in _headers_meta_fingerprint_cache[request]
+
+    def test_caching_keeps_distinct_versions_apart(self):
+        request = Request("http://example.com", meta={"tenant": "a"})
+
+        class TenantFingerprinterV2(_TenantFingerprinter):
+            VERSION = 2
+
+        v1 = _TenantFingerprinter()
+        v2 = TenantFingerprinterV2()
+        fp1 = v1.fingerprint(request)
+        fp2 = v2.fingerprint(request)
+        # Recomputing after the other policy used the cache must return each
+        # policy's own fingerprint, not the cached entry of the other one.
+        assert v2.fingerprint(request) == fp2
+        assert v1.fingerprint(request) == fp1
+        cache = _headers_meta_fingerprint_cache[request]
+        assert cache[(1, v1._include_headers, v1._include_meta, False, False)] == fp1
+        assert cache[(2, v2._include_headers, v2._include_meta, False, False)] == fp2
+
+    def test_version_changes_fingerprint(self):
+        fingerprinter_v1 = _TenantFingerprinter()
+
+        class TenantFingerprinterV2(_TenantFingerprinter):
+            VERSION = 2
+
+        fingerprinter_v2 = TenantFingerprinterV2()
+        request = Request("http://example.com", meta={"tenant": "a"})
+        assert fingerprinter_v1.fingerprint(request) != fingerprinter_v2.fingerprint(
+            request
+        )
+
+    def test_policy_change_changes_fingerprint(self):
+        tenant_only = HeadersMetaRequestFingerprinter(include_meta=("tenant",))
+        tenant_and_org = HeadersMetaRequestFingerprinter(include_meta=("org", "tenant"))
+        r1 = Request("http://example.com", meta={"tenant": "a", "org": "x"})
+        r2 = Request("http://example.com", meta={"tenant": "a", "org": "y"})
+        assert tenant_only.fingerprint(r1) == tenant_only.fingerprint(r2)
+        assert tenant_and_org.fingerprint(r1) != tenant_and_org.fingerprint(r2)
+
+    def test_missing_meta_key(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com")
+        r2 = Request("http://example.com", meta={"tenant": None})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_verbatim_url(self):
+        fingerprinter = _TenantFingerprinter()
+        r1 = Request("http://example.com/query?a=1&b=2", meta={"verbatim_url": True})
+        r2 = Request("http://example.com/query?b=2&a=1", meta={"verbatim_url": True})
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r2)
+
+    def test_from_crawler(self):
+        crawler = get_crawler(
+            settings_dict={"REQUEST_FINGERPRINTER_CLASS": _TenantFingerprinter}
+        )
+        fingerprinter = crawler.request_fingerprinter
+        assert isinstance(fingerprinter, _TenantFingerprinter)
+        r1 = Request("http://example.com", meta={"tenant": "a"})
+        r2 = Request("http://example.com", meta={"tenant": "b"})
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r2)
 
 
 class TestCustomRequestFingerprinter:

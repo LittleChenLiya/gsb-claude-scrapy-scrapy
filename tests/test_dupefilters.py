@@ -15,6 +15,7 @@ from scrapy.exceptions import ScrapyDeprecationWarning
 from scrapy.http import Request
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.python import to_bytes
+from scrapy.utils.request import HeadersMetaRequestFingerprinter
 from scrapy.utils.test import get_crawler
 from tests.spiders import SimpleSpider
 
@@ -161,6 +162,121 @@ class TestRFPDupeFilter:
                 df2.open()
                 assert df2.request_seen(r1)
                 assert not df2.request_seen(r2)
+            finally:
+                df2.close("finished")
+        finally:
+            shutil.rmtree(path)
+
+    def test_headers_meta_fingerprinter_persists(self):
+        class TenantFingerprinter(HeadersMetaRequestFingerprinter):
+            include_meta = ("tenant",)
+
+        settings = {"REQUEST_FINGERPRINTER_CLASS": TenantFingerprinter}
+        r1 = Request("http://scrapytest.org/1", meta={"tenant": "a"})
+        r2 = Request("http://scrapytest.org/2", meta={"tenant": "a"})
+        r1_other_tenant = Request("http://scrapytest.org/1", meta={"tenant": "b"})
+
+        path = tempfile.mkdtemp()
+        try:
+            df = _get_dupefilter(settings={**settings, "JOBDIR": path}, open_=False)
+            try:
+                df.open()
+                assert not df.request_seen(r1)
+                assert df.request_seen(r1)
+            finally:
+                df.close("finished")
+
+            # The same request, including its business context, is a duplicate
+            # after the filter is reopened from the job directory.
+            df2 = _get_dupefilter(settings={**settings, "JOBDIR": path}, open_=False)
+            try:
+                df2.open()
+                assert df2.request_seen(r1)
+                assert not df2.request_seen(r1_other_tenant)
+                assert not df2.request_seen(r2)
+            finally:
+                df2.close("finished")
+        finally:
+            shutil.rmtree(path)
+
+    def test_headers_meta_fingerprinter_version_invalidates_on_disk(self):
+        class TenantFingerprinterV1(HeadersMetaRequestFingerprinter):
+            include_meta = ("tenant",)
+
+        class TenantFingerprinterV2(TenantFingerprinterV1):
+            VERSION = 2
+
+        request = Request("http://scrapytest.org/1", meta={"tenant": "a"})
+
+        path = tempfile.mkdtemp()
+        try:
+            df = _get_dupefilter(
+                settings={
+                    "REQUEST_FINGERPRINTER_CLASS": TenantFingerprinterV1,
+                    "JOBDIR": path,
+                },
+                open_=False,
+            )
+            try:
+                df.open()
+                assert not df.request_seen(request)
+            finally:
+                df.close("finished")
+
+            # With a bumped policy version, fingerprints stored on disk must not
+            # silently match: the request is seen as new again.
+            df2 = _get_dupefilter(
+                settings={
+                    "REQUEST_FINGERPRINTER_CLASS": TenantFingerprinterV2,
+                    "JOBDIR": path,
+                },
+                open_=False,
+            )
+            try:
+                df2.open()
+                assert not df2.request_seen(request)
+                assert df2.request_seen(request)
+            finally:
+                df2.close("finished")
+        finally:
+            shutil.rmtree(path)
+
+    def test_headers_meta_fingerprinter_policy_change_invalidates_on_disk(self):
+        class TenantFingerprinter(HeadersMetaRequestFingerprinter):
+            include_meta = ("tenant",)
+
+        class TenantOrgFingerprinter(HeadersMetaRequestFingerprinter):
+            include_meta = ("org", "tenant")
+
+        request = Request("http://scrapytest.org/1", meta={"tenant": "a", "org": "x"})
+
+        path = tempfile.mkdtemp()
+        try:
+            df = _get_dupefilter(
+                settings={
+                    "REQUEST_FINGERPRINTER_CLASS": TenantFingerprinter,
+                    "JOBDIR": path,
+                },
+                open_=False,
+            )
+            try:
+                df.open()
+                assert not df.request_seen(request)
+            finally:
+                df.close("finished")
+
+            # Selecting a different set of meta keys also prevents on-disk
+            # fingerprints from being silently reused.
+            df2 = _get_dupefilter(
+                settings={
+                    "REQUEST_FINGERPRINTER_CLASS": TenantOrgFingerprinter,
+                    "JOBDIR": path,
+                },
+                open_=False,
+            )
+            try:
+                df2.open()
+                assert not df2.request_seen(request)
             finally:
                 df2.close("finished")
         finally:

@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 from urllib.parse import urlunparse
 from weakref import WeakKeyDictionary
 
@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 
 _fingerprint_cache: WeakKeyDictionary[
     Request, dict[tuple[tuple[bytes, ...] | None, bool, bool], bytes]
+] = WeakKeyDictionary()
+
+# Separate from _fingerprint_cache because the cache key includes the
+# HeadersMetaRequestFingerprinter policy (selected headers, meta keys, version).
+_headers_meta_fingerprint_cache: WeakKeyDictionary[
+    Request,
+    dict[
+        tuple[
+            int,
+            tuple[bytes, ...] | None,
+            tuple[str, ...] | None,
+            bool,
+            bool,
+        ],
+        bytes,
+    ],
 ] = WeakKeyDictionary()
 
 
@@ -136,6 +152,178 @@ class RequestFingerprinter:
 
     def fingerprint(self, request: Request) -> bytes:
         return self._fingerprint(request)
+
+
+def _stable_meta_value(value: Any, path: str) -> Any:
+    """Return a JSON-friendly version of a selected ``request.meta`` value.
+
+    Only values that serialize deterministically are accepted. ``bytes`` are
+    encoded as hex because JSON has no bytes type, like header values are.
+    Unknown object types raise :exc:`TypeError`; their representation is never
+    used, since it is not guaranteed to stay stable across processes or runs.
+    *path* names the meta entry (with container indices) for the error message.
+    """
+    # bool is a subclass of int, so it must be checked first.
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        return {"__bytes_hex__": value.hex()}
+    if isinstance(value, tuple):
+        return [
+            _stable_meta_value(item, f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, list):
+        return [
+            _stable_meta_value(item, f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        encoded: dict[str, Any] = {}
+        for key in sorted(value):
+            if not isinstance(key, str):
+                raise TypeError(f"Request meta key {path!r} has a non-string dict key")
+            encoded[key] = _stable_meta_value(value[key], f"{path}[{key!r}]")
+        return encoded
+    raise TypeError(
+        f"Request meta key {path!r} has a value of an unsupported type"
+        f" {type(value).__name__}"
+    )
+
+
+class HeadersMetaRequestFingerprinter:
+    """Optional fingerprinter that also takes selected request headers and
+    :attr:`~scrapy.Request.meta` entries into account.
+
+    Requests that share a URL, method and body but belong to different business
+    contexts (for example different tenants identified by a header or a meta
+    key) get different fingerprints, while requests that only differ in meta
+    entries that are not selected keep sharing a fingerprint.
+
+    The URL (canonicalized, as with :class:`RequestFingerprinter`), method and
+    body are fingerprinted exactly like with :func:`fingerprint`. Header names
+    are matched case-insensitively, and the values of a header with multiple
+    values contribute in the order in which the request stores them, so
+    different orders produce different fingerprints. Selected meta values must
+    be stably serializable: ``None``, booleans, integers, floats, strings,
+    bytes (hex-encoded), lists, tuples and dictionaries with string keys. Any
+    other type makes :meth:`fingerprint` raise :exc:`TypeError`. The request,
+    including its meta, is never modified.
+
+    .. versionadded:: VERSION
+
+    Configure it with the :setting:`REQUEST_FINGERPRINTER_CLASS` setting,
+    typically through a subclass that sets the headers and meta keys:
+
+    .. code-block:: python
+
+        from scrapy.utils.request import HeadersMetaRequestFingerprinter
+
+
+        class RequestFingerprinter(HeadersMetaRequestFingerprinter):
+            include_headers = ("X-Tenant",)
+            include_meta = ("tenant",)
+
+    Fingerprints carry a policy version marker, so fingerprints stored in a
+    :ref:`job directory <job-dir>` by one policy can never silently match
+    fingerprints produced by another policy (see :attr:`VERSION`).
+    """
+
+    #: Bump (or change) this whenever the configured headers or meta keys, or
+    #: the meaning of their values, change. It is part of the fingerprint and
+    #: of the cache key, so data deduplicated on disk with the old policy is not
+    #: reused after the change.
+    VERSION: ClassVar[int] = 1
+
+    #: Default selected headers, used when no *include_headers* argument is
+    #: given. Override in a subclass instead of repeating it in ``__init__``.
+    include_headers: ClassVar[Iterable[bytes | str] | None] = None
+
+    #: Default selected meta keys, used when no *include_meta* argument is
+    #: given. Override in a subclass instead of repeating it in ``__init__``.
+    include_meta: ClassVar[Iterable[str] | None] = None
+
+    def __init__(
+        self,
+        crawler: Crawler | None = None,
+        *,
+        include_headers: Iterable[bytes | str] | None = None,
+        include_meta: Iterable[str] | None = None,
+        keep_fragments: bool = False,
+    ) -> None:
+        if include_headers is None:
+            include_headers = type(self).include_headers
+        if include_meta is None:
+            include_meta = type(self).include_meta
+        self._include_headers: tuple[bytes, ...] | None = (
+            tuple(to_bytes(h.lower()) for h in sorted(include_headers))
+            if include_headers
+            else None
+        )
+        self._include_meta: tuple[str, ...] | None = (
+            tuple(sorted(include_meta)) if include_meta else None
+        )
+        self._keep_fragments = keep_fragments
+
+    @classmethod
+    def from_crawler(cls, crawler: Crawler) -> Self:
+        return cls(crawler)
+
+    def fingerprint(self, request: Request) -> bytes:
+        verbatim_url = bool(request.meta.get("verbatim_url"))
+        cache = _headers_meta_fingerprint_cache.setdefault(request, {})
+        cache_key = (
+            self.VERSION,
+            self._include_headers,
+            self._include_meta,
+            self._keep_fragments and not verbatim_url,
+            verbatim_url,
+        )
+        if cache_key not in cache:
+            # Header names and values are hex-encoded, like in fingerprint(),
+            # so that arbitrary bytes survive the JSON encoding.
+            headers: dict[str, list[str]] = {}
+            if self._include_headers:
+                for header in self._include_headers:
+                    if header in request.headers:
+                        headers[header.hex()] = [
+                            value.hex() for value in request.headers.getlist(header)
+                        ]
+            # Selected meta values are encoded without mutating request.meta.
+            # A missing key is encoded like an explicit None so that the two
+            # cannot produce different identities.
+            meta: dict[str, Any] = {}
+            if self._include_meta:
+                for key in self._include_meta:
+                    meta[key] = _stable_meta_value(request.meta.get(key), key)
+            if verbatim_url:
+                url = request.url
+            else:
+                url = canonicalize_url(request.url, keep_fragments=self._keep_fragments)
+            fingerprint_data = {
+                "method": to_unicode(request.method),
+                "url": url,
+                "body": (request.body or b"").hex(),
+                "headers": headers,
+                "meta": meta,
+                # Policy markers: changing the version or the selected headers
+                # or meta keys changes every fingerprint, which keeps old
+                # on-disk dedup data from silently matching new fingerprints.
+                "policy": {
+                    "version": self.VERSION,
+                    "headers": (
+                        [header.hex() for header in self._include_headers]
+                        if self._include_headers
+                        else []
+                    ),
+                    "meta": list(self._include_meta or []),
+                },
+            }
+            fingerprint_json = json.dumps(fingerprint_data, sort_keys=True)
+            cache[cache_key] = hashlib.sha1(  # noqa: S324
+                fingerprint_json.encode()
+            ).digest()
+        return cache[cache_key]
 
 
 def request_httprepr(request: Request) -> bytes:

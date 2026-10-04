@@ -378,6 +378,57 @@ account:
         def fingerprint(self, request):
             return fingerprint(request, include_headers=["X-ID"])
 
+Including headers and request meta in fingerprints
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When requests with the same URL, method and body belong to different business
+contexts (for example different tenants identified by a header or a
+:attr:`~scrapy.Request.meta` entry), use
+:class:`~scrapy.utils.request.HeadersMetaRequestFingerprinter`, an optional
+fingerprinter that adds selected headers and meta entries to the identity of
+the default fingerprinter:
+
+.. autoclass:: scrapy.utils.request.HeadersMetaRequestFingerprinter
+
+Configure it through a subclass that declares the header names and meta keys
+to take into account:
+
+.. code-block:: python
+
+    # my_project/settings.py
+    REQUEST_FINGERPRINTER_CLASS = "my_project.utils.RequestFingerprinter"
+
+    # my_project/utils.py
+    from scrapy.utils.request import HeadersMetaRequestFingerprinter
+
+
+    class RequestFingerprinter(HeadersMetaRequestFingerprinter):
+        include_headers = ("X-Tenant",)
+        include_meta = ("tenant",)
+
+With this fingerprinter, two requests for the same URL with different
+``tenant`` meta values get different fingerprints, while changing a meta
+entry that is not listed (such as a debugging entry) leaves the fingerprint
+unchanged. Header names are matched case-insensitively. The values of a
+header sent multiple times contribute in the order in which they are stored,
+so swapping that order changes the fingerprint.
+
+Selected meta values must be stably serializable: ``None``, booleans,
+integers, floats, strings, bytes, lists, tuples and dictionaries with string
+keys. Other object types make fingerprinting raise :exc:`TypeError`; the
+fingerprinter never falls back to the object's representation, which may not
+be stable, and it never modifies the request.
+
+Because changing the selected headers or meta keys changes the meaning of a
+fingerprint, the fingerprint carries a policy version marker,
+:attr:`~scrapy.utils.request.HeadersMetaRequestFingerprinter.VERSION`.
+Fingerprints are also cached per request with a key that includes that
+version. When you change your policy, bump ``VERSION`` (for example from
+``1`` to ``2``); fingerprints previously saved in a :ref:`job directory
+<job-dir>` then cannot silently match fingerprints produced by the new
+policy, so requests seen under the old policy are treated as new instead of
+being wrongly filtered as duplicates.
+
 You can also write your own fingerprinting logic from scratch.
 
 However, if you do not use :func:`scrapy.utils.request.fingerprint`, make sure
