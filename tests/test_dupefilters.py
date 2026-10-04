@@ -15,6 +15,7 @@ from scrapy.exceptions import ScrapyDeprecationWarning
 from scrapy.http import Request
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.python import to_bytes
+from scrapy.utils.request import ContextRequestFingerprinter
 from scrapy.utils.test import get_crawler
 from tests.spiders import SimpleSpider
 
@@ -108,6 +109,57 @@ class TestRFPDupeFilter:
                 assert df2.request_seen(r2)
             finally:
                 df2.close("finished")
+        finally:
+            shutil.rmtree(path)
+
+    def test_context_fingerprinter_disk_dedup(self):
+        # Disk deduplication data is compatible with the context request
+        # fingerprinter: seen requests are persisted and reused across runs,
+        # but changing the fingerprinting policy prevents old data from being
+        # silently reused.
+        path = tempfile.mkdtemp()
+        try:
+            settings = {
+                "JOBDIR": path,
+                "REQUEST_FINGERPRINTER_CLASS": ContextRequestFingerprinter,
+                "REQUEST_FINGERPRINTER_INCLUDE_META": ["tenant"],
+            }
+            r_a = Request("http://scrapytest.org/1", meta={"tenant": "a"})
+            r_b = Request("http://scrapytest.org/1", meta={"tenant": "b"})
+
+            df = _get_dupefilter(settings=settings, open_=False)
+            try:
+                df.open()
+                assert not df.request_seen(r_a)
+                assert df.request_seen(r_a)
+                assert not df.request_seen(r_b)
+                assert df.request_seen(r_b)
+            finally:
+                df.close("finished")
+
+            # Reopen: the seen requests are persisted on disk and still
+            # considered seen.
+            df2 = _get_dupefilter(settings=settings, open_=False)
+            try:
+                df2.open()
+                assert df2.request_seen(r_a)
+                assert df2.request_seen(r_b)
+            finally:
+                df2.close("finished")
+
+            # Change the policy version: the old disk data must not be silently
+            # reused, so previously seen requests are not seen anymore.
+            settings_v2 = dict(settings)
+            settings_v2["REQUEST_FINGERPRINTER_VERSION"] = "2"
+            df3 = _get_dupefilter(settings=settings_v2, open_=False)
+            try:
+                df3.open()
+                assert not df3.request_seen(r_a)
+                assert not df3.request_seen(r_b)
+                # The new policy still deduplicates requests within its run.
+                assert df3.request_seen(r_a)
+            finally:
+                df3.close("finished")
         finally:
             shutil.rmtree(path)
 

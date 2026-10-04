@@ -10,6 +10,8 @@ import pytest
 from scrapy.http import Request
 from scrapy.utils.python import to_bytes
 from scrapy.utils.request import (
+    ContextRequestFingerprinter,
+    _context_fingerprint_cache,
     _fingerprint_cache,
     fingerprint,
     request_httprepr,
@@ -277,6 +279,242 @@ class TestRequestFingerprinter:
         assert crawler.request_fingerprinter.fingerprint(request) == fingerprint(
             request
         )
+
+
+class TestContextRequestFingerprinter:
+    def test_tenant_meta(self):
+        # Two requests with the same URL but a different tenant meta value
+        # must get different fingerprints.
+        fingerprinter = ContextRequestFingerprinter(include_meta=["tenant"])
+        r_a = Request("http://www.example.com", meta={"tenant": "a"})
+        r_b = Request("http://www.example.com", meta={"tenant": "b"})
+        assert fingerprinter.fingerprint(r_a) != fingerprinter.fingerprint(r_b)
+
+    def test_unlisted_meta_ignored(self):
+        # Meta keys that are not part of the policy do not affect the
+        # fingerprint, even if their values change.
+        fingerprinter = ContextRequestFingerprinter(include_meta=["tenant"])
+        r1 = Request("http://www.example.com", meta={"tenant": "a", "debug": "one"})
+        r2 = Request("http://www.example.com", meta={"tenant": "a", "debug": "two"})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_missing_meta_ignored(self):
+        # A request that lacks a policy meta key and a request whose value is
+        # different get different fingerprints, while two requests that both
+        # lack the key get the same one.
+        fingerprinter = ContextRequestFingerprinter(include_meta=["tenant"])
+        r1 = Request("http://www.example.com")
+        r2 = Request("http://www.example.com")
+        r3 = Request("http://www.example.com", meta={"tenant": "a"})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r3)
+
+    def test_header_case_insensitive(self):
+        # Header names are case-insensitive.
+        fingerprinter = ContextRequestFingerprinter(include_headers=["X-Tenant"])
+        r1 = Request("http://www.example.com", headers={"X-Tenant": "a"})
+        r2 = Request("http://www.example.com", headers={"x-tenant": "a"})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_header_value_matters(self):
+        fingerprinter = ContextRequestFingerprinter(include_headers=["X-Tenant"])
+        r1 = Request("http://www.example.com", headers={"X-Tenant": "a"})
+        r2 = Request("http://www.example.com", headers={"X-Tenant": "b"})
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r2)
+
+    def test_unlisted_header_ignored(self):
+        fingerprinter = ContextRequestFingerprinter(include_headers=["X-Tenant"])
+        r1 = Request("http://www.example.com", headers={"X-Tenant": "a"})
+        r2 = Request(
+            "http://www.example.com",
+            headers={"X-Tenant": "a", "X-Debug": "yes"},
+        )
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_header_multi_value_order(self):
+        # The policy defines the multi-value order: header names are sorted
+        # (policy order is irrelevant), while multiple values of a header keep
+        # the order in which they appear in the request.
+        fp1 = ContextRequestFingerprinter(include_headers=["X-First", "X-Second"])
+        fp2 = ContextRequestFingerprinter(include_headers=["X-Second", "X-First"])
+        r1 = Request(
+            "http://www.example.com",
+            headers=[("X-First", "a"), ("X-Second", "b")],
+        )
+        r2 = Request(
+            "http://www.example.com",
+            headers=[("X-Second", "b"), ("X-First", "a")],
+        )
+        assert fp1.fingerprint(r1) == fp2.fingerprint(r2)
+
+        # Multiple values of the same header keep their order.
+        fingerprinter = ContextRequestFingerprinter(include_headers=["X-Multi"])
+        r3 = Request(
+            "http://www.example.com",
+            headers=[("X-Multi", "a"), ("X-Multi", "b")],
+        )
+        r4 = Request(
+            "http://www.example.com",
+            headers=[("X-Multi", "b"), ("X-Multi", "a")],
+        )
+        assert fingerprinter.fingerprint(r3) != fingerprinter.fingerprint(r4)
+
+    def test_version_affects_fingerprint(self):
+        # The version marker is part of the fingerprint.
+        r = Request("http://www.example.com", meta={"tenant": "a"})
+        fp_v1 = ContextRequestFingerprinter(include_meta=["tenant"], version="1")
+        fp_v2 = ContextRequestFingerprinter(include_meta=["tenant"], version="2")
+        assert fp_v1.fingerprint(r) != fp_v2.fingerprint(r)
+
+    def test_version_in_cache_key(self):
+        # The policy id, which includes the version, is the cache key.
+        r = Request("http://www.example.com", meta={"tenant": "a"})
+        fp_v1 = ContextRequestFingerprinter(include_meta=["tenant"], version="1")
+        fp_v2 = ContextRequestFingerprinter(include_meta=["tenant"], version="2")
+        assert fp_v1.policy_id != fp_v2.policy_id
+        assert _context_fingerprint_cache.get(r, {}) == {}
+        fp_v1.fingerprint(r)
+        assert fp_v1.policy_id in _context_fingerprint_cache[r]
+        assert fp_v2.policy_id not in _context_fingerprint_cache[r]
+        fp_v2.fingerprint(r)
+        assert fp_v2.policy_id in _context_fingerprint_cache[r]
+        # Both fingerprints are cached independently.
+        assert len(_context_fingerprint_cache[r]) == 2
+
+    def test_policy_change_affects_fingerprint(self):
+        # Changing the policy (headers or meta keys) changes the policy id and
+        # thus the fingerprint, even without bumping the version.
+        r = Request(
+            "http://www.example.com",
+            headers={"X-Tenant": "a"},
+            meta={"tenant": "a"},
+        )
+        fp_headers = ContextRequestFingerprinter(include_headers=["X-Tenant"])
+        fp_meta = ContextRequestFingerprinter(include_meta=["tenant"])
+        fp_both = ContextRequestFingerprinter(
+            include_headers=["X-Tenant"], include_meta=["tenant"]
+        )
+        assert fp_headers.policy_id != fp_meta.policy_id
+        assert fp_headers.fingerprint(r) != fp_meta.fingerprint(r)
+        assert fp_both.fingerprint(r) != fp_headers.fingerprint(r)
+        assert fp_both.fingerprint(r) != fp_meta.fingerprint(r)
+
+    def test_unserializable_meta_raises(self):
+        # Meta values that cannot be stably encoded raise TypeError instead of
+        # being repr()-encoded.
+        fingerprinter = ContextRequestFingerprinter(include_meta=["tenant", "bad"])
+        r = Request(
+            "http://www.example.com",
+            meta={"tenant": "a", "bad": object()},
+        )
+        with pytest.raises(TypeError, match="bad"):
+            fingerprinter.fingerprint(r)
+        # The request is not modified by fingerprinting.
+        assert r.meta["tenant"] == "a"
+        assert "bad" in r.meta
+
+    def test_unserializable_meta_not_in_policy(self):
+        # Unserializable meta values that are not part of the policy are
+        # ignored and do not raise.
+        fingerprinter = ContextRequestFingerprinter(include_meta=["tenant"])
+        r = Request(
+            "http://www.example.com",
+            meta={"tenant": "a", "bad": object()},
+        )
+        assert len(fingerprinter.fingerprint(r)) == 20
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            True,
+            False,
+            1,
+            1.5,
+            "string",
+            b"bytes",
+            [1, "two", b"three"],
+            (1, "two"),
+            {"key": "value", "nested": [1, 2]},
+        ],
+    )
+    def test_stable_meta_values(self, value):
+        fingerprinter = ContextRequestFingerprinter(include_meta=["data"])
+        r1 = Request("http://www.example.com", meta={"data": value})
+        r2 = Request("http://www.example.com", meta={"data": value})
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_request_copy(self):
+        # Copies of a request share the same fingerprint, while copies with a
+        # different meta value get a different fingerprint.
+        fingerprinter = ContextRequestFingerprinter(include_meta=["tenant"])
+        r1 = Request("http://www.example.com", meta={"tenant": "a"})
+        fp1 = fingerprinter.fingerprint(r1)
+        r2 = r1.copy()
+        assert fingerprinter.fingerprint(r2) == fp1
+        r3 = r1.replace(meta={"tenant": "b"})
+        assert fingerprinter.fingerprint(r3) != fp1
+
+    def test_request_copy_headers(self):
+        fingerprinter = ContextRequestFingerprinter(include_headers=["X-Tenant"])
+        r1 = Request("http://www.example.com", headers={"X-Tenant": "a"})
+        fp1 = fingerprinter.fingerprint(r1)
+        r2 = r1.copy()
+        assert fingerprinter.fingerprint(r2) == fp1
+        r3 = r1.replace(headers={"X-Tenant": "b"})
+        assert fingerprinter.fingerprint(r3) != fp1
+
+    def test_from_crawler(self):
+        settings = {
+            "REQUEST_FINGERPRINTER_CLASS": ContextRequestFingerprinter,
+            "REQUEST_FINGERPRINTER_INCLUDE_HEADERS": ["X-Tenant"],
+            "REQUEST_FINGERPRINTER_INCLUDE_META": ["tenant"],
+            "REQUEST_FINGERPRINTER_VERSION": "2",
+        }
+        crawler = get_crawler(settings_dict=settings)
+        fingerprinter = crawler.request_fingerprinter
+        assert isinstance(fingerprinter, ContextRequestFingerprinter)
+        assert fingerprinter.version == "2"
+        r1 = Request(
+            "http://www.example.com",
+            headers={"X-Tenant": "a"},
+            meta={"tenant": "a"},
+        )
+        r2 = Request(
+            "http://www.example.com",
+            headers={"X-Tenant": "b"},
+            meta={"tenant": "b"},
+        )
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r2)
+
+    def test_from_crawler_defaults(self):
+        crawler = get_crawler(
+            settings_dict={
+                "REQUEST_FINGERPRINTER_CLASS": ContextRequestFingerprinter,
+            }
+        )
+        fingerprinter = crawler.request_fingerprinter
+        assert isinstance(fingerprinter, ContextRequestFingerprinter)
+        assert fingerprinter.version == "1"
+        # With an empty policy the fingerprinter still produces a valid
+        # fingerprint.
+        r = Request("http://www.example.com")
+        assert len(fingerprinter.fingerprint(r)) == 20
+
+    def test_does_not_modify_request(self):
+        fingerprinter = ContextRequestFingerprinter(
+            include_headers=["X-Tenant"], include_meta=["tenant"]
+        )
+        r = Request(
+            "http://www.example.com",
+            headers={"X-Tenant": "a"},
+            meta={"tenant": "a"},
+        )
+        headers_before = dict(r.headers)
+        meta_before = dict(r.meta)
+        fingerprinter.fingerprint(r)
+        assert dict(r.headers) == headers_before
+        assert dict(r.meta) == meta_before
 
 
 class TestCustomRequestFingerprinter:

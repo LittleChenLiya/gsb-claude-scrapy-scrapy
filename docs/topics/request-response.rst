@@ -331,6 +331,82 @@ import path.
 
 .. autoclass:: scrapy.utils.request.RequestFingerprinter
 
+.. _context-request-fingerprinter:
+
+Including request headers and meta keys in the fingerprint
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: scrapy.utils.request.ContextRequestFingerprinter
+
+The :class:`~scrapy.utils.request.ContextRequestFingerprinter` is an optional
+request fingerprinter that, on top of the canonical URL, method and body, also
+takes into account selected request headers and selected :attr:`request.meta
+<scrapy.Request.meta>` keys. This is useful when requests that share the same
+URL, method and body have a different business context and should not be
+treated as duplicates: for example, requests for different tenants of a same
+site.
+
+Enable it through the :setting:`REQUEST_FINGERPRINTER_CLASS` setting, and
+configure which headers and meta keys to include:
+
+.. code-block:: python
+
+    # settings.py
+    REQUEST_FINGERPRINTER_CLASS = "scrapy.utils.request.ContextRequestFingerprinter"
+    REQUEST_FINGERPRINTER_INCLUDE_HEADERS = ["X-Tenant"]
+    REQUEST_FINGERPRINTER_INCLUDE_META = ["tenant"]
+
+With the above settings, two requests with the same URL but a different
+``tenant`` meta value (or a different ``X-Tenant`` header value) get different
+fingerprints, while changes to any other meta key or header do not affect the
+fingerprint.
+
+.. setting:: REQUEST_FINGERPRINTER_INCLUDE_HEADERS
+
+REQUEST_FINGERPRINTER_INCLUDE_HEADERS
+*************************************
+
+Default: ``[]``
+
+A list of request header names to include in the fingerprint when using the
+:class:`~scrapy.utils.request.ContextRequestFingerprinter`. Header names are
+case-insensitive and their order in the list does not matter (they are sorted),
+while the order of multiple values of a header is the order in which they
+appear in the request.
+
+.. setting:: REQUEST_FINGERPRINTER_INCLUDE_META
+
+REQUEST_FINGERPRINTER_INCLUDE_META
+**********************************
+
+Default: ``[]``
+
+A list of :attr:`request.meta <scrapy.Request.meta>` keys to include in the
+fingerprint when using the
+:class:`~scrapy.utils.request.ContextRequestFingerprinter`. Only the listed
+keys are taken into account; any other meta key (e.g. debug information) is
+ignored.
+
+Meta values must be stable encodable: ``None``, :class:`bool`, :class:`int`,
+:class:`float`, :class:`str`, :class:`bytes`, :class:`list`, :class:`tuple`
+and :class:`dict` values are supported. Any other value raises
+:class:`TypeError` (``repr()`` is never used as a fallback).
+
+.. setting:: REQUEST_FINGERPRINTER_VERSION
+
+REQUEST_FINGERPRINTER_VERSION
+*****************************
+
+Default: ``"1"``
+
+A version marker of the fingerprinting policy used by the
+:class:`~scrapy.utils.request.ContextRequestFingerprinter`. It is part of both
+the fingerprint itself and the internal cache key. Changing the policy (this
+version marker, or any of the :setting:`REQUEST_FINGERPRINTER_INCLUDE_HEADERS`
+and :setting:`REQUEST_FINGERPRINTER_INCLUDE_META` settings) changes the
+fingerprints, so disk deduplication data (see :setting:`JOBDIR`) from a
+previous policy is never silently reused.
+
 .. _custom-request-fingerprinter:
 
 Writing your own request fingerprinter
