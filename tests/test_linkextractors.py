@@ -4,11 +4,13 @@ import pickle
 import re
 from typing import Any
 
+import pytest
 from w3lib.url import canonicalize_url
 
 from scrapy.http import HtmlResponse, TextResponse, XmlResponse
+from scrapy.http.request import Request
 from scrapy.link import Link
-from scrapy.linkextractors import lxmlhtml
+from scrapy.linkextractors import extract_links_report, lxmlhtml
 from scrapy.linkextractors.lxmlhtml import LxmlLinkExtractor, LxmlParserLinkExtractor
 from tests import get_testdata
 
@@ -922,3 +924,138 @@ class TestLxmlParserLinkExtractor:
             strip=False, process=reject_trailing_whitespace
         )
         assert lx_no_strip.extract_links(response) == []
+
+
+@pytest.fixture
+def redirected_response() -> HtmlResponse:
+    """An HtmlResponse whose final URL differs from the original request URL.
+
+    This simulates a redirect: the request was originally for
+    ``http://example.com/old`` but the response landed on
+    ``http://example.com/redirected/page``. Relative links found in the
+    response must be resolved against the final URL, not the original one.
+    """
+    html = b"""
+    <html><body>
+      <a href="http://example.com/keep.html">keep</a>
+      <a href="http://other.com/page">other domain</a>
+      <a href="rel/link.html">relative</a>
+      <a href="javascript:alert(1)">js</a>
+      <a href="http://example.com/keep.html">dup</a>
+      <a href="http://example.com/photo.jpg">jpg</a>
+    </body></html>
+    """
+    return HtmlResponse(
+        url="http://example.com/redirected/page",
+        body=html,
+        request=Request("http://example.com/old"),
+    )
+
+
+class TestLinkReport:
+    def test_report_resolves_relative_links_against_final_url(
+        self, redirected_response
+    ):
+        lx = LxmlLinkExtractor(allow_domains=["example.com"])
+        report = extract_links_report(redirected_response, lx)
+        by_url = {entry.link.url: entry for entry in report}
+        # The relative link is resolved against the final URL, not the
+        # original request URL (http://example.com/old).
+        assert "http://example.com/redirected/rel/link.html" in by_url
+        assert "http://example.com/old/rel/link.html" not in by_url
+        rel = by_url["http://example.com/redirected/rel/link.html"]
+        assert rel.accepted
+        assert rel.reason == "accepted"
+
+    def test_report_domain_whitelist_exclusion_has_reason(self, redirected_response):
+        lx = LxmlLinkExtractor(allow_domains=["example.com"])
+        report = extract_links_report(redirected_response, lx)
+        other = next(e for e in report if e.link.url == "http://other.com/page")
+        assert not other.accepted
+        assert other.reason == "domain_not_allowed"
+
+    def test_report_same_address_keeps_sources(self, redirected_response):
+        lx = LxmlLinkExtractor(allow_domains=["example.com"])
+        report = extract_links_report(redirected_response, lx)
+        same = [e for e in report if e.link.url == "http://example.com/keep.html"]
+        assert len(same) == 2
+        # Both occurrences are reported, each with its own source location.
+        assert same[0].source != same[1].source
+        assert same[0].accepted
+        assert not same[1].accepted
+        assert same[1].reason == "duplicate"
+
+    def test_report_invalid_protocol_precedes_other_checks(self, redirected_response):
+        lx = LxmlLinkExtractor(allow_domains=["example.com"])
+        report = extract_links_report(redirected_response, lx)
+        js = next(e for e in report if e.link.url == "javascript:alert(1)")
+        assert not js.accepted
+        assert js.reason == "invalid_protocol"
+
+    def test_report_denied_extension_reason(self, redirected_response):
+        lx = LxmlLinkExtractor(allow_domains=["example.com"])
+        report = extract_links_report(redirected_response, lx)
+        jpg = next(e for e in report if e.link.url == "http://example.com/photo.jpg")
+        assert not jpg.accepted
+        assert jpg.reason == "denied_extension"
+
+    def test_report_accepted_links_match_extract_links(self, redirected_response):
+        lx = LxmlLinkExtractor(allow_domains=["example.com"])
+        report = extract_links_report(redirected_response, lx)
+        accepted = [e.link for e in report if e.accepted]
+        assert accepted == lx.extract_links(redirected_response)
+
+    def test_report_is_read_only(self, redirected_response):
+        lx = LxmlLinkExtractor(allow_domains=["example.com"])
+        before = lx.extract_links(redirected_response)
+        extract_links_report(redirected_response, lx)
+        after = lx.extract_links(redirected_response)
+        assert before == after
+
+    def test_report_deny_and_allow_reasons(self):
+        html = b"""
+        <a href="http://example.com/keep.html">keep</a>
+        <a href="http://example.com/skip.html">skip</a>
+        <a href="http://example.com/other.html">other</a>
+        """
+        response = HtmlResponse("http://example.com/", body=html)
+        lx = LxmlLinkExtractor(allow=("keep", "skip"), deny=("skip",))
+        report = extract_links_report(response, lx)
+        by_url = {e.link.url: e for e in report}
+        assert by_url["http://example.com/keep.html"].accepted
+        assert by_url["http://example.com/keep.html"].reason == "accepted"
+        assert not by_url["http://example.com/skip.html"].accepted
+        assert by_url["http://example.com/skip.html"].reason == "denied"
+        assert not by_url["http://example.com/other.html"].accepted
+        assert by_url["http://example.com/other.html"].reason == "not_allowed"
+
+    def test_report_domain_denied_reason(self):
+        html = b'<a href="http://example.com/page">x</a>'
+        response = HtmlResponse("http://example.com/", body=html)
+        lx = LxmlLinkExtractor(deny_domains=["example.com"])
+        report = extract_links_report(response, lx)
+        entry = report[0]
+        assert not entry.accepted
+        assert entry.reason == "domain_denied"
+
+    def test_report_text_not_matched_reason(self):
+        html = b'<a href="http://example.com/page">Pic of a cat</a>'
+        response = HtmlResponse("http://example.com/", body=html)
+        lx = LxmlLinkExtractor(restrict_text="dog")
+        report = extract_links_report(response, lx)
+        entry = report[0]
+        assert not entry.accepted
+        assert entry.reason == "text_not_matched"
+
+    def test_report_keeps_fragments_by_default(self):
+        html = b"""
+        <a href="http://example.com/page#frag">with fragment</a>
+        <a href="http://example.com/page#frag">same fragment</a>
+        """
+        response = HtmlResponse("http://example.com/", body=html)
+        lx = LxmlLinkExtractor()
+        report = extract_links_report(response, lx)
+        assert report[0].accepted
+        assert report[0].link.url == "http://example.com/page#frag"
+        assert not report[1].accepted
+        assert report[1].reason == "duplicate"

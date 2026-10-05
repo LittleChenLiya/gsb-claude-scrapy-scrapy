@@ -113,6 +113,45 @@ class LxmlParserLinkExtractor:
                     continue
                 yield el, attrib, attribs[attrib]
 
+    def _build_link(
+        self,
+        el: HtmlElement,
+        attr_val: str,
+        response_url: str,
+        response_encoding: str,
+        base_url: str,
+    ) -> Link | None:
+        """Build a :class:`~scrapy.link.Link` from a single attribute value.
+
+        Return ``None`` when the value is bogus and the link should be
+        skipped. The logic mirrors the body of :meth:`_extract_links` so that
+        other read-only tools (e.g. a scope report) can reuse it.
+        """
+        # pseudo lxml.html.HtmlElement.make_links_absolute(base_url)
+        try:
+            if self.strip:
+                attr_val = strip_html5_whitespace(attr_val)
+            attr_val = urljoin(base_url, attr_val)
+        except ValueError:
+            return None  # skipping bogus links
+        else:
+            url = self.process_attr(attr_val)
+            if url is None:
+                return None
+        try:
+            url = safe_url_string(url, encoding=response_encoding)
+        except ValueError:
+            logger.debug(f"Skipping extraction of link with bad URL {url!r}")
+            return None
+
+        # to fix relative links after process_value
+        url = urljoin(response_url, url)
+        return Link(
+            url,
+            _collect_string_content(el) or "",
+            nofollow=rel_has_nofollow(el.get("rel")),
+        )
+
     def _extract_links(
         self,
         selector: Selector,
@@ -123,31 +162,11 @@ class LxmlParserLinkExtractor:
         links: list[Link] = []
         # hacky way to get the underlying lxml parsed document
         for el, _, attr_val in self._iter_links(selector.root):
-            # pseudo lxml.html.HtmlElement.make_links_absolute(base_url)
-            try:
-                if self.strip:
-                    attr_val = strip_html5_whitespace(attr_val)  # noqa: PLW2901 this is intended
-                attr_val = urljoin(base_url, attr_val)  # noqa: PLW2901
-            except ValueError:
-                continue  # skipping bogus links
-            else:
-                url = self.process_attr(attr_val)
-                if url is None:
-                    continue
-            try:
-                url = safe_url_string(url, encoding=response_encoding)
-            except ValueError:
-                logger.debug(f"Skipping extraction of link with bad URL {url!r}")
-                continue
-
-            # to fix relative links after process_value
-            url = urljoin(response_url, url)
-            link = Link(
-                url,
-                _collect_string_content(el) or "",
-                nofollow=rel_has_nofollow(el.get("rel")),
+            link = self._build_link(
+                el, attr_val, response_url, response_encoding, base_url
             )
-            links.append(link)
+            if link is not None:
+                links.append(link)
         return self._deduplicate_if_needed(links)
 
     def extract_links(self, response: TextResponse) -> list[Link]:
@@ -359,24 +378,34 @@ class LxmlLinkExtractor:
         ]
 
     def _link_allowed(self, link: Link) -> bool:
+        return self._link_allowed_with_reason(link)[0]
+
+    def _link_allowed_with_reason(self, link: Link) -> tuple[bool, str]:
+        """Return whether *link* is allowed and the reason for the decision.
+
+        The checks follow the same order as :meth:`_link_allowed`, so the
+        first failing check is reported as the reason for exclusion.
+        """
         if not _is_valid_url(link.url):
-            return False
+            return False, "invalid_protocol"
         if self.allow_res and not _matches(link.url, self.allow_res):
-            return False
+            return False, "not_allowed"
         if self.deny_res and _matches(link.url, self.deny_res):
-            return False
+            return False, "denied"
         parsed_url = urlparse(link.url)
         if self.allow_domains and not url_is_from_any_domain(
             parsed_url, self.allow_domains
         ):
-            return False
+            return False, "domain_not_allowed"
         if self.deny_domains and url_is_from_any_domain(parsed_url, self.deny_domains):
-            return False
+            return False, "domain_denied"
         if self.deny_extensions and url_has_any_extension(
             parsed_url, self.deny_extensions
         ):
-            return False
-        return not self.restrict_text or _matches(link.text, self.restrict_text)
+            return False, "denied_extension"
+        if self.restrict_text and not _matches(link.text, self.restrict_text):
+            return False, "text_not_matched"
+        return True, "accepted"
 
     def matches(self, url: str) -> bool:
         if self.allow_domains and not url_is_from_any_domain(url, self.allow_domains):
