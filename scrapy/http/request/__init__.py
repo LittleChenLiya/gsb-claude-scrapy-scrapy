@@ -24,6 +24,7 @@ from w3lib.url import safe_url_string
 # a workaround for the docs "more than one target found" problem
 import scrapy  # noqa: TC001
 from scrapy.http.headers import Headers
+from scrapy.http.request.copy import RequestCopyPolicy, copy_request
 from scrapy.utils.curl import curl_to_request_kwargs
 from scrapy.utils.python import to_bytes
 from scrapy.utils.trackref import object_ref
@@ -332,6 +333,30 @@ class Request(object_ref):
 
     def copy(self) -> Self:
         return self.replace()
+
+    def safe_copy(self, policy: RequestCopyPolicy | None = None) -> Self:
+        """Return a copy of this request following an explicit copy policy.
+
+        Unlike :meth:`copy` and :meth:`replace`, which shallow-copy
+        :attr:`meta` and :attr:`cb_kwargs`, this method copies them key by
+        key according to *policy* (a
+        :class:`~scrapy.http.request.copy.RequestCopyPolicy`, using the
+        default rules when ``None``):
+
+        -   Immutable scalars and callables are shared by identity
+            (callables, including :attr:`callback`, are never called).
+        -   Mutable containers are recursively copied, so mutating the
+            returned request never affects this one.
+        -   Values that cannot be safely copied raise
+            :class:`~scrapy.http.request.copy.UnsafeRequestCopyError`
+            reporting the key path, leaving this request untouched.
+        -   Registered internal meta keys (e.g. the retry protocol keys)
+            are handled according to their registered rule, and unauthorized
+            debug keys are dropped.
+
+        .. seealso:: :func:`~scrapy.http.request.copy.copy_request`
+        """
+        return copy_request(self, policy)  # type: ignore[return-value]
 
     @overload
     def replace(

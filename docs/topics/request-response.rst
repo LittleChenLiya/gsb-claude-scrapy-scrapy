@@ -207,6 +207,62 @@ Request objects
        copied by default (unless new values are given as arguments). See also
        :ref:`callback-data`.
 
+    .. automethod:: safe_copy
+
+    .. _topics-request-copy-policy:
+
+    .. rubric:: Explicit copy policy
+
+    :meth:`Request.safe_copy` (see also
+    :func:`~scrapy.http.request.copy.copy_request` and
+    :class:`~scrapy.http.request.copy.RequestCopyPolicy`) copies a request
+    following an explicit, configurable policy instead of shallow-copying
+    :attr:`~scrapy.Request.meta` and :attr:`~scrapy.Request.cb_kwargs`:
+
+    -   Only allowed keys of ``meta`` and ``cb_kwargs`` are copied.
+        Unauthorized debug keys (prefixes ``debug_`` and ``_debug`` by
+        default) are dropped.
+    -   Immutable scalars and callables are shared by identity; callables
+        (including ``callback``) are never called during copying.
+    -   Mutable containers are recursively copied, so mutating the copy
+        never affects the original request.
+    -   Registered internal meta keys (the retry protocol keys
+        ``retry_times``, ``max_retry_times``, ``dont_retry`` and
+        ``retry_reason`` by default) are handled according to their
+        registered rule (``"copy"`` or ``"drop"``) and are never dropped
+        just because they look internal.
+    -   Values that cannot be safely copied raise
+        :class:`~scrapy.http.request.copy.UnsafeRequestCopyError` reporting
+        the key path (e.g. ``meta['session']``), and the original request
+        is left untouched.
+
+    Example copy rules::
+
+        from scrapy.http.request.copy import RequestCopyPolicy
+
+        policy = RequestCopyPolicy(
+            # copy only these meta keys (plus registered internal keys)
+            allowed_meta_keys=frozenset({"item", "retry_times"}),
+            # copy only these cb_kwargs keys
+            allowed_cb_kwargs_keys=frozenset({"page"}),
+            # extra keys to drop explicitly
+            denied_keys=frozenset({"session"}),
+            # keys with these prefixes are dropped (default: debug keys)
+            denied_key_prefixes=("debug_", "_debug"),
+            # registered internal keys and their rule: "copy" or "drop"
+            internal_key_rules={
+                "retry_times": "copy",
+                "max_retry_times": "copy",
+                "dont_retry": "copy",
+                "retry_reason": "copy",
+            },
+        )
+        new_request = request.safe_copy(policy)
+
+    Run the focused tests for this feature with::
+
+        python -m pytest tests/test_request_copy_policy.py -v
+
     .. automethod:: from_curl
 
     .. automethod:: to_curl
