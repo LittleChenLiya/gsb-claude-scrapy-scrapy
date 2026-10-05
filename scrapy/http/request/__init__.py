@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
     # circular import
     from scrapy.http import Response
+    from scrapy.http.request.copy_strategy import CopyStrategy
 
     CallbackT: TypeAlias = Callable[Concatenate[Response, ...], Any]
 
@@ -330,8 +331,22 @@ class Request(object_ref):
     def __repr__(self) -> str:
         return f"<{self.method} {self.url}>"
 
-    def copy(self) -> Self:
-        return self.replace()
+    def copy(self, *, strategy: CopyStrategy | None = None) -> Self:
+        """Return a new Request which is a copy of this Request.
+
+        If *strategy* is ``None`` (the default), the copy is a shallow copy
+        of all attributes, as in previous versions. If a
+        :class:`~scrapy.http.request.copy_strategy.CopyStrategy` is given,
+        only the meta and cb_kwargs keys allowed by the strategy are copied,
+        immutable values are shared, mutable values are deep-copied, and
+        values of unsupported types cause an
+        :class:`~scrapy.http.request.copy_strategy.UncopyableValueError` to
+        be raised. See :class:`~scrapy.http.request.copy_strategy.CopyStrategy`
+        for details.
+        """
+        if strategy is None:
+            return self.replace()
+        return strategy.copy(self)
 
     @overload
     def replace(

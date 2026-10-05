@@ -194,10 +194,25 @@ Request objects
 
     .. autoattribute:: Request.attributes
 
-    .. method:: Request.copy()
+    .. method:: Request.copy(*, strategy=None)
 
        Return a new Request which is a copy of this Request. See also:
        :ref:`callback-data`.
+
+       If *strategy* is ``None`` (the default), the copy is a shallow copy
+       of all attributes, as in previous versions. If a
+       :class:`~scrapy.http.request.copy_strategy.CopyStrategy` is given,
+       only the meta and cb_kwargs keys allowed by the strategy are copied,
+       immutable values are shared, mutable values are deep-copied, and
+       values of unsupported types cause an
+       :class:`~scrapy.http.request.copy_strategy.UncopyableValueError` to
+       be raised. The callback and errback objects are preserved by identity
+       but never executed. See
+       :class:`~scrapy.http.request.copy_strategy.CopyStrategy` for the
+       copy rules and examples.
+
+       .. versionchanged:: 2.19
+          Added the *strategy* parameter.
 
     .. method:: Request.replace([url, method, headers, body, cookies, meta, flags, encoding, priority, dont_filter, callback, errback, cb_kwargs, cls])
 
@@ -206,6 +221,98 @@ Request objects
        :attr:`~scrapy.Request.cb_kwargs` and :attr:`~scrapy.Request.meta` attributes are shallow
        copied by default (unless new values are given as arguments). See also
        :ref:`callback-data`.
+
+    .. autoclass:: scrapy.http.request.copy_strategy.CopyStrategy
+
+       .. automethod:: CopyStrategy.copy
+
+       .. automethod:: CopyStrategy.copy_meta
+
+       .. automethod:: CopyStrategy.copy_cb_kwargs
+
+       **Copy rules**
+
+       The explicit copy strategy is opt-in: pass a
+       :class:`~scrapy.http.request.copy_strategy.CopyStrategy` to
+       :meth:`~scrapy.Request.copy` to use it. The rules are:
+
+       * only the meta keys and cb_kwargs keys in the configured
+         allowed-keys whitelist are copied;
+       * immutable values (``str``, ``bytes``, ``int``, ``float``, ``bool``
+         and ``None``) are shared with the original request;
+       * mutable containers (``dict``, ``list``, ``tuple``, ``set``,
+         ``frozenset`` and ``bytearray``) are deep-copied, so mutating them
+         on the copy never affects the original request;
+       * values of any other type cause an
+         :class:`~scrapy.http.request.copy_strategy.UncopyableValueError`
+         to be raised with the full key path of the offending value (e.g.
+         ``meta['key'][0]``);
+       * registered internal protocol meta keys (e.g. retry protocol keys
+         such as ``retry_times``) are handled according to their registered
+         rule (:class:`~scrapy.http.request.copy_strategy.CopyRule`), so
+         they are not casually dropped;
+       * the callback and errback objects are preserved by identity but
+         never executed;
+       * if the copy fails, the original request is left untouched.
+
+       **Examples**
+
+       Copy only the allowed meta and cb_kwargs keys, deep-copying mutable
+       values:
+
+       .. code-block:: python
+
+          from scrapy import Request
+          from scrapy.http.request.copy_strategy import CopyStrategy
+
+          request = Request(
+              "https://example.com",
+              meta={"source_url": "https://example.com", "debug": "secret"},
+              cb_kwargs={"item": {"name": "foo"}},
+          )
+          strategy = CopyStrategy(
+              allowed_meta_keys={"source_url"},
+              allowed_cb_kwargs_keys={"item"},
+          )
+          copy = request.copy(strategy=strategy)
+
+          assert copy.meta == {"source_url": "https://example.com"}
+          assert copy.cb_kwargs == {"item": {"name": "foo"}}
+          # mutating the copy does not affect the original request
+          copy.cb_kwargs["item"]["name"] = "bar"
+          assert request.cb_kwargs["item"]["name"] == "foo"
+
+       Registered retry protocol meta keys are preserved even when they are
+       not in the whitelist:
+
+       .. code-block:: python
+
+          request = Request(
+              "https://example.com",
+              meta={"retry_times": 3, "debug": "secret"},
+          )
+          copy = request.copy(strategy=CopyStrategy())
+
+          assert copy.meta["retry_times"] == 3
+          assert "debug" not in copy.meta
+
+       Values of unsupported types are rejected with the full key path:
+
+       .. code-block:: python
+
+          class Uncopyable:
+              pass
+
+          request = Request("https://example.com", meta={"bad": Uncopyable()})
+          request.copy(strategy=CopyStrategy(allowed_meta_keys={"bad"}))
+          # UncopyableValueError: Cannot safely copy value at meta['bad']:
+          # Uncopyable object is not of a supported type
+
+    .. autoclass:: scrapy.http.request.copy_strategy.CopyRule
+
+    .. autoclass:: scrapy.http.request.copy_strategy.ProtocolKeyRule
+
+    .. autoexception:: scrapy.http.request.copy_strategy.UncopyableValueError
 
     .. automethod:: from_curl
 
