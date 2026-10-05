@@ -7,7 +7,9 @@ from __future__ import annotations
 import logging
 import operator
 import re
+from collections import Counter
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 from urllib.parse import urljoin, urlparse
@@ -113,16 +115,19 @@ class LxmlParserLinkExtractor:
                     continue
                 yield el, attrib, attribs[attrib]
 
-    def _extract_links(
+    def _iter_parsed_links(
         self,
         selector: Selector,
         response_url: str,
         response_encoding: str,
         base_url: str,
-    ) -> list[Link]:
-        links: list[Link] = []
+    ) -> Iterable[tuple[Link, HtmlElement, str]]:
+        """Yield ``(link, element, attribute)`` for every parsed link, in
+        document order and without deduplication, so that callers can track
+        the source position of each link.
+        """
         # hacky way to get the underlying lxml parsed document
-        for el, _, attr_val in self._iter_links(selector.root):
+        for el, attrib, attr_val in self._iter_links(selector.root):
             # pseudo lxml.html.HtmlElement.make_links_absolute(base_url)
             try:
                 if self.strip:
@@ -147,7 +152,21 @@ class LxmlParserLinkExtractor:
                 _collect_string_content(el) or "",
                 nofollow=rel_has_nofollow(el.get("rel")),
             )
-            links.append(link)
+            yield link, el, attrib
+
+    def _extract_links(
+        self,
+        selector: Selector,
+        response_url: str,
+        response_encoding: str,
+        base_url: str,
+    ) -> list[Link]:
+        links: list[Link] = [
+            link
+            for link, _, _ in self._iter_parsed_links(
+                selector, response_url, response_encoding, base_url
+            )
+        ]
         return self._deduplicate_if_needed(links)
 
     def extract_links(self, response: TextResponse) -> list[Link]:
@@ -171,6 +190,131 @@ class LxmlParserLinkExtractor:
 
 _Regex: TypeAlias = str | re.Pattern[str]
 _RegexOrSeveral: TypeAlias = _Regex | Iterable[_Regex]
+
+
+#: Reason codes used by :class:`LinkExplanation`.
+#:
+#: - ``"accepted"``: the link passed every rule and is kept.
+#: - ``"protocol"``: the URL scheme is not one of ``http``, ``https``,
+#:   ``file`` or ``ftp``. This is always the first check, before any
+#:   domain/path/scheduling rule.
+#: - ``"path"``: the URL was rejected by ``allow``/``deny`` patterns or by
+#:   ``deny_extensions``.
+#: - ``"domain"``: the URL host was rejected by ``allow_domains`` or
+#:   ``deny_domains``.
+#: - ``"text"``: the link text did not match ``restrict_text``.
+#: - ``"dedup"``: the link is a duplicate of an earlier entry under the
+#:   current dedup key. For :class:`LxmlLinkExtractor` the key is the
+#:   extracted URL itself (query string and fragment included, compared
+#:   as-is), or its canonicalized form when ``canonicalize=True``.
+REASON_ACCEPTED = "accepted"
+REASON_PROTOCOL = "protocol"
+REASON_PATH = "path"
+REASON_DOMAIN = "domain"
+REASON_TEXT = "text"
+REASON_DEDUP = "dedup"
+
+
+@dataclass
+class LinkSource:
+    """Where in the response a link occurrence was found."""
+
+    #: Index of this occurrence among all scanned links, in scan order.
+    occurrence: int
+    #: Index of the ``restrict_xpaths``/``restrict_css`` document the link was
+    #: found in (``0`` when no restriction is used).
+    document: int
+    #: Tag name of the element holding the link, e.g. ``"a"``.
+    tag: str
+    #: Attribute of the element holding the link, e.g. ``"href"``.
+    attribute: str
+
+    def __str__(self) -> str:
+        return (
+            f"entry #{self.occurrence} "
+            f"(document {self.document}, <{self.tag}> @{self.attribute})"
+        )
+
+
+@dataclass
+class LinkExplanation:
+    """The verdict for a single extracted link occurrence."""
+
+    #: The extracted link. For accepted entries its URL is the final one,
+    #: identical to what :meth:`LxmlLinkExtractor.extract_links` returns.
+    link: Link
+    #: Where this occurrence was found in the response.
+    source: LinkSource
+    #: Whether the link is kept (would be returned by ``extract_links``).
+    accepted: bool = True
+    #: Machine-readable reason code, see the ``REASON_*`` constants.
+    reason: str = REASON_ACCEPTED
+    #: Human-readable explanation of the verdict.
+    detail: str = "kept: passes all extraction rules"
+
+    @property
+    def url(self) -> str:
+        return self.link.url
+
+    def exclude(self, reason: str, detail: str) -> None:
+        self.accepted = False
+        self.reason = reason
+        self.detail = detail
+
+    def __str__(self) -> str:
+        verdict = "accepted" if self.accepted else f"excluded:{self.reason}"
+        return f"[{verdict}] {self.link.url} from {self.source} - {self.detail}"
+
+
+@dataclass
+class LinkScopeReport:
+    """A read-only report explaining, for every link occurrence extracted
+    from a response, whether it was accepted or excluded and why.
+
+    Produced by :meth:`LxmlLinkExtractor.explain_links`. Building the report
+    never issues network requests and never changes the result of
+    :meth:`LxmlLinkExtractor.extract_links`.
+    """
+
+    #: The final response URL (after redirects) that links were resolved
+    #: against.
+    response_url: str
+    #: The base URL used to resolve relative links (``<base href>`` aware).
+    base_url: str
+    #: One entry per extracted link occurrence, in scan order. Duplicate
+    #: occurrences of the same URL are all listed, each with its own source.
+    entries: list[LinkExplanation] = field(default_factory=list)
+
+    @property
+    def accepted(self) -> list[LinkExplanation]:
+        """Entries that would be returned by ``extract_links``."""
+        return [entry for entry in self.entries if entry.accepted]
+
+    @property
+    def excluded(self) -> list[LinkExplanation]:
+        """Entries rejected by protocol, path, domain, text or dedup rules."""
+        return [entry for entry in self.entries if not entry.accepted]
+
+    @property
+    def links(self) -> list[Link]:
+        """The accepted links, identical to ``extract_links`` output."""
+        return [entry.link for entry in self.accepted]
+
+    def summary(self) -> dict[str, int]:
+        """Count of entries per reason code."""
+        return dict(Counter(entry.reason for entry in self.entries))
+
+    def explain(self) -> str:
+        """Render the report as human-readable text."""
+        lines = [
+            f"Link scope report for {self.response_url} (base URL: {self.base_url})",
+            (
+                f"total: {len(self.entries)}, accepted: {len(self.accepted)}, "
+                f"excluded: {len(self.excluded)}, summary: {self.summary()}"
+            ),
+        ]
+        lines.extend(str(entry) for entry in self.entries)
+        return "\n".join(lines)
 
 
 class LxmlLinkExtractor:
@@ -426,3 +570,152 @@ class LxmlLinkExtractor:
         if self.link_extractor.unique:
             return unique_list(all_links, key=self.link_extractor.link_key)
         return all_links
+
+    def _explain_link(self, link: Link) -> tuple[str, str] | None:
+        """Return ``(reason, detail)`` for the first rule that rejects *link*,
+        or ``None`` if the link passes every rule.
+
+        The checks run in the same order as :meth:`_link_allowed`: protocol
+        first, then path patterns, domains, extensions and link text.
+        """
+        if not _is_valid_url(link.url):
+            scheme = (
+                link.url.split("://", 1)[0]
+                if "://" in link.url
+                else link.url.split(":", 1)[0]
+            )
+            return (
+                REASON_PROTOCOL,
+                f"scheme {scheme!r} is not one of 'http', 'https', 'file', 'ftp'",
+            )
+        if self.allow_res and not _matches(link.url, self.allow_res):
+            return (
+                REASON_PATH,
+                "URL does not match any 'allow' pattern: "
+                + ", ".join(repr(r.pattern) for r in self.allow_res),
+            )
+        if self.deny_res and _matches(link.url, self.deny_res):
+            matched = next(r for r in self.deny_res if r.search(link.url))
+            return (REASON_PATH, f"URL matches 'deny' pattern {matched.pattern!r}")
+        parsed_url = urlparse(link.url)
+        if self.allow_domains and not url_is_from_any_domain(
+            parsed_url, self.allow_domains
+        ):
+            return (
+                REASON_DOMAIN,
+                (
+                    f"domain {parsed_url.hostname!r} is not in allow_domains "
+                    f"{sorted(self.allow_domains)}"
+                ),
+            )
+        if self.deny_domains and url_is_from_any_domain(parsed_url, self.deny_domains):
+            return (
+                REASON_DOMAIN,
+                (
+                    f"domain {parsed_url.hostname!r} matches deny_domains "
+                    f"{sorted(self.deny_domains)}"
+                ),
+            )
+        if self.deny_extensions and url_has_any_extension(
+            parsed_url, self.deny_extensions
+        ):
+            return (
+                REASON_PATH,
+                (
+                    "URL path ends with a denied extension "
+                    f"{sorted(self.deny_extensions)}"
+                ),
+            )
+        if self.restrict_text and not _matches(link.text, self.restrict_text):
+            return (
+                REASON_TEXT,
+                f"link text {link.text!r} does not match any 'restrict_text' pattern",
+            )
+        return None
+
+    def _mark_duplicates(self, entries: list[LinkExplanation], stage: str) -> None:
+        """Mark duplicate entries in-place, mirroring the dedup passes of
+        :meth:`extract_links` (same ``unique`` flag and same link key)."""
+        seen: dict[str, int] = {}
+        for entry in entries:
+            if not entry.accepted:
+                continue
+            key = self.link_extractor.link_key(entry.link)
+            if key in seen:
+                entry.exclude(
+                    REASON_DEDUP,
+                    f"duplicate of entry #{seen[key]}: same dedup key {key!r} "
+                    f"({stage} dedup; the key is the extracted URL, fragment "
+                    "included, unless canonicalize=True)",
+                )
+            else:
+                seen[key] = entry.source.occurrence
+
+    def explain_links(self, response: TextResponse) -> LinkScopeReport:
+        """Return a :class:`LinkScopeReport` explaining, for every link
+        occurrence found in *response*, whether it was accepted or excluded
+        and why (protocol, path, domain, text or dedup rules).
+
+        This is a read-only, offline analysis: it parses the already
+        downloaded *response* exactly like :meth:`extract_links` does,
+        resolving relative links against the final response URL
+        (``response.url``, i.e. the URL after redirects, or the
+        ``<base href>`` tag when present), and it never issues new requests
+        for the extracted links. Calling it does not change the result of
+        :meth:`extract_links`; ``report.links`` is identical to
+        ``extract_links(response)``.
+
+        Every occurrence is reported, so two references to the same address
+        keep their individual sources (:attr:`LinkExplanation.source`), even
+        when deduplication keeps only the first one.
+        """
+        base_url = get_base_url(response)
+        if self.restrict_xpaths:
+            docs = [
+                cast("Selector", subdoc)
+                for x in self.restrict_xpaths
+                for subdoc in response.xpath(x)
+            ]
+        else:
+            docs = [response.selector]
+        entries: list[LinkExplanation] = []
+        for document, doc in enumerate(docs):
+            doc_entries = [
+                LinkExplanation(
+                    link=link,
+                    source=LinkSource(
+                        occurrence=len(entries) + offset,
+                        document=document,
+                        tag=_nons(el.tag),
+                        attribute=attrib,
+                    ),
+                )
+                for offset, (link, el, attrib) in enumerate(
+                    self.link_extractor._iter_parsed_links(
+                        doc, response.url, response.encoding, base_url
+                    )
+                )
+            ]
+            # Mirror the extract_links pipeline stages in order:
+            # parser-level dedup, rule filtering, canonicalization,
+            # post-filter dedup.
+            if self.link_extractor.unique:
+                self._mark_duplicates(doc_entries, "parser-level")
+            for entry in doc_entries:
+                if not entry.accepted:
+                    continue
+                verdict = self._explain_link(entry.link)
+                if verdict is not None:
+                    entry.exclude(*verdict)
+            if self.canonicalize:
+                for entry in doc_entries:
+                    if entry.accepted:
+                        entry.link.url = canonicalize_url(entry.link.url)
+            if self.link_extractor.unique:
+                self._mark_duplicates(doc_entries, "post-filter")
+            entries.extend(doc_entries)
+        if self.link_extractor.unique:
+            self._mark_duplicates(entries, "global")
+        return LinkScopeReport(
+            response_url=response.url, base_url=base_url, entries=entries
+        )

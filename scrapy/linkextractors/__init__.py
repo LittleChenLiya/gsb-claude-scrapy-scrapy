@@ -125,9 +125,13 @@ def _is_valid_url(url: str) -> bool:
 
 
 # Top-level imports
+from scrapy.linkextractors.lxmlhtml import LinkExplanation, LinkScopeReport, LinkSource
 from scrapy.linkextractors.lxmlhtml import LxmlLinkExtractor as LinkExtractor
 
 __all__ = [
     "IGNORED_EXTENSIONS",
+    "LinkExplanation",
     "LinkExtractor",
+    "LinkScopeReport",
+    "LinkSource",
 ]
